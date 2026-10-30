@@ -7,7 +7,8 @@ vi.hoisted(() => {
   process.env.TRUST_PROXY = "true";
 });
 
-import app from "./app";
+import app, { APP_DEVICE_RATE_LIMIT_PER_IP } from "./app";
+import { appRouter } from "./router";
 
 beforeAll(() => {
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -71,5 +72,84 @@ describe("Hono authentication perimeter", () => {
     }
     const blocked = await post(url, "198.51.100.12");
     expect(blocked.status).toBe(429);
+  });
+});
+
+describe("CinéKin Player device API perimeter", () => {
+  it("exposes deviceStatus and devicePlaylists as mutations so the PIN never goes in a URL", () => {
+    // At runtime tRPC exposes a flat map keyed by the dotted procedure path.
+    const procedures = appRouter._def.procedures as unknown as Record<
+      string,
+      { _def: { type: string } }
+    >;
+    expect(procedures["app.deviceStatus"]._def.type).toBe("mutation");
+    expect(procedures["app.devicePlaylists"]._def.type).toBe("mutation");
+    expect(procedures["app.registerDevice"]._def.type).toBe("mutation");
+  });
+
+  it.each(["app.deviceStatus", "app.devicePlaylists", "app.registerDevice"])(
+    "does not apply the strict ten-attempt quota to %s",
+    async name => {
+      const url = `http://cine.test/api/trpc/${name}`;
+      for (let attempt = 1; attempt <= 15; attempt += 1) {
+        const response = await post(url, "198.51.100.40");
+        expect(response.status).not.toBe(429);
+      }
+    }
+  );
+
+  it("caps the device API per IP with its own quota", async () => {
+    // The general limiter (100/min/IP) shares the IP key and would answer 429
+    // first in a burst: the clock is moved forward between bursts so that
+    // only the 15-minute device quota is exercised here.
+    const url = "http://cine.test/api/trpc/app.deviceStatus";
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      for (let attempt = 1; attempt <= APP_DEVICE_RATE_LIMIT_PER_IP; attempt += 1) {
+        vi.setSystemTime(start + Math.floor(attempt / 90) * 61_000);
+        const response = await post(url, "198.51.100.41");
+        expect(response.status).not.toBe(429);
+      }
+      const blocked = await post(url, "198.51.100.41");
+      expect(blocked.status).toBe(429);
+      await expect(blocked.json()).resolves.toMatchObject({
+        error: "Trop de requêtes. Réessayez dans 15 minutes.",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks every device API response as non-cacheable, errors included", async () => {
+    const response = await post(
+      "http://cine.test/api/trpc/app.deviceStatus",
+      "198.51.100.43"
+    );
+    expect(response.status).toBe(400);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("requires the superjson envelope used by the documented contract", async () => {
+    const response = await app.request(
+      "http://cine.test/api/trpc/app.deviceStatus",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-forwarded-for": "198.51.100.44",
+        },
+        body: JSON.stringify({ mac: "6E:63:F8:C4:03:0A", pin: "123456" }),
+      }
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it("blocks a batched device request before tRPC executes it", async () => {
+    const response = await post(
+      "http://cine.test/api/trpc/app.deviceStatus,app.devicePlaylists?batch=1",
+      "198.51.100.42"
+    );
+    expect(response.status).toBe(400);
   });
 });

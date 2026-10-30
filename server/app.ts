@@ -15,8 +15,9 @@ import {
 import { Paths } from "@contracts/constants";
 import {
   hasAllowedOrigin,
+  isDeviceApiTrpcRequest,
+  isHumanLoginTrpcRequest,
   isSensitiveTrpcBatch,
-  isSensitiveTrpcRequest,
   sensitiveProcedureKey,
 } from "./lib/trpc-security";
 import { env } from "./lib/env";
@@ -36,6 +37,15 @@ type AppEnv = {
 //   - server/index.ts → wraps it with hono/vercel as a single Vercel Serverless
 //     Function.
 const app = new Hono<AppEnv>();
+
+// Per-IP quotas (15-minute windows, one counter per IP AND per procedure).
+// Human logins keep a strict quota. The CinéKin Player device API gets a
+// separate, generous one: behind a mobile carrier NAT, dozens of legitimate
+// devices share one public IP. If legitimate HTTP 429 responses show up in
+// production, raise APP_DEVICE_RATE_LIMIT_PER_IP.
+const HUMAN_LOGIN_RATE_LIMIT_PER_IP = 10;
+export const APP_DEVICE_RATE_LIMIT_PER_IP = 300;
+const SENSITIVE_RATE_LIMIT_WINDOW_MS = 15 * 60_000;
 
 // Extract the client IP used as the rate-limiter key. Forwarded headers are
 // ignored unless the deployment explicitly trusts a known number of proxies.
@@ -118,6 +128,16 @@ app.use("/api/trpc/*", async (c, next) => {
   return next();
 });
 
+// Device API responses carry a PIN-authenticated status and, for
+// devicePlaylists, credentials: never cacheable, including errors (400 input
+// validation, 401, 429) that are answered before the resolvers run.
+app.use("/api/trpc/*", async (c, next) => {
+  await next();
+  if (isDeviceApiTrpcRequest(c.req.url)) {
+    c.res.headers.set("Cache-Control", "no-store");
+  }
+});
+
 // A single tRPC HTTP batch used to execute many password guesses while the
 // HTTP rate limiter counted only one request. Sensitive public procedures must
 // therefore use the non-batched transport.
@@ -134,21 +154,39 @@ app.use("/api/trpc/*", async (c, next) => {
   return next();
 });
 
-// Dedicated protection for public authentication/device procedures. It is
-// deliberately stricter than the general API quota. Production uses the shared
-// MySQL store so all serverless instances enforce one global counter.
+// Dedicated protection for human login procedures. It is deliberately
+// stricter than the general API quota. Production uses the shared MySQL store
+// so all serverless instances enforce one global counter.
 app.use(
   "/api/trpc/*",
   rateLimiter<AppEnv>({
-    windowMs: 15 * 60_000,
-    limit: 10,
+    windowMs: SENSITIVE_RATE_LIMIT_WINDOW_MS,
+    limit: HUMAN_LOGIN_RATE_LIMIT_PER_IP,
     standardHeaders: "draft-6",
     requestPropertyName: "authRateLimit",
     requestStorePropertyName: "authRateLimitStore",
     store: createRateLimitStore<AppEnv>("auth"),
-    skip: c => !isSensitiveTrpcRequest(c.req.url),
+    skip: c => !isHumanLoginTrpcRequest(c.req.url),
     keyGenerator: c => `${getClientIp(c)}:${sensitiveProcedureKey(c.req.url)}`,
     message: { error: "Trop de tentatives. Réessayez dans 15 minutes." },
+  })
+);
+
+// Device API (app.registerDevice, app.deviceStatus, app.devicePlaylists):
+// generous per-IP ceiling. PIN brute force is limited per MAC inside the
+// resolvers (server/app-device-router.ts), independently of the IP.
+app.use(
+  "/api/trpc/*",
+  rateLimiter<AppEnv>({
+    windowMs: SENSITIVE_RATE_LIMIT_WINDOW_MS,
+    limit: APP_DEVICE_RATE_LIMIT_PER_IP,
+    standardHeaders: "draft-6",
+    requestPropertyName: "appDeviceRateLimit",
+    requestStorePropertyName: "appDeviceRateLimitStore",
+    store: createRateLimitStore<AppEnv>("app-device"),
+    skip: c => !isDeviceApiTrpcRequest(c.req.url),
+    keyGenerator: c => `${getClientIp(c)}:${sensitiveProcedureKey(c.req.url)}`,
+    message: { error: "Trop de requêtes. Réessayez dans 15 minutes." },
   })
 );
 
@@ -177,7 +215,9 @@ app.use("/api/trpc/*", async c => {
     endpoint: "/api/trpc",
     req: c.req.raw,
     router: appRouter,
-    createContext,
+    // The trusted client IP is computed here (it needs the Node socket) and
+    // handed to the resolvers, e.g. for the new-device-per-IP limit.
+    createContext: opts => createContext(opts, { clientIp: getClientIp(c) }),
   });
 });
 app.all("/api/*", c => c.json({ error: "Not Found" }, 404));

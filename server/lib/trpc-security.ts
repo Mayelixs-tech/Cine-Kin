@@ -1,8 +1,24 @@
-const SENSITIVE_PUBLIC_PROCEDURES = new Set([
+// Human logins (admin, reseller, client portal): strict per-IP quota.
+const HUMAN_LOGIN_PROCEDURES = new Set([
   "auth.adminLogin",
   "clientPortal.login",
   "reseller.login",
+]);
+
+// Device API called by the CinéKin Player app. Many legitimate devices can
+// share one IP behind a mobile carrier NAT, so these get their own, more
+// generous per-IP quota; brute force is stopped by the per-MAC lockout instead.
+const DEVICE_API_PROCEDURES = new Set([
   "app.registerDevice",
+  "app.deviceStatus",
+  "app.devicePlaylists",
+]);
+
+// Every public procedure that checks a secret: tRPC batching is forbidden for
+// all of them, otherwise one HTTP request could carry many guesses.
+const SENSITIVE_PUBLIC_PROCEDURES = new Set([
+  ...HUMAN_LOGIN_PROCEDURES,
+  ...DEVICE_API_PROCEDURES,
 ]);
 
 function asUrl(input: string | URL): URL {
@@ -31,6 +47,18 @@ export function trpcProcedureNames(input: string | URL): string[] {
 export function isSensitiveTrpcRequest(input: string | URL): boolean {
   return trpcProcedureNames(input).some(name =>
     SENSITIVE_PUBLIC_PROCEDURES.has(name)
+  );
+}
+
+export function isHumanLoginTrpcRequest(input: string | URL): boolean {
+  return trpcProcedureNames(input).some(name =>
+    HUMAN_LOGIN_PROCEDURES.has(name)
+  );
+}
+
+export function isDeviceApiTrpcRequest(input: string | URL): boolean {
+  return trpcProcedureNames(input).some(name =>
+    DEVICE_API_PROCEDURES.has(name)
   );
 }
 

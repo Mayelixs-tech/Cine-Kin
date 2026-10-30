@@ -37,6 +37,8 @@ const PASSWORD_ADMIN_USER: User = {
 export type TrpcContext = {
   req: Request;
   resHeaders: Headers;
+  // Trusted client IP (see server/lib/client-ip.ts). Absent in unit tests.
+  clientIp?: string;
   user?: User;
   appClient?: AppClient;
   reseller?: Reseller;
@@ -87,9 +89,14 @@ async function loadReseller(
 }
 
 export async function createContext(
-  opts: FetchCreateContextFnOptions
+  opts: FetchCreateContextFnOptions,
+  extra: { clientIp?: string } = {}
 ): Promise<TrpcContext> {
-  const ctx: TrpcContext = { req: opts.req, resHeaders: opts.resHeaders };
+  const ctx: TrpcContext = {
+    req: opts.req,
+    resHeaders: opts.resHeaders,
+    clientIp: extra.clientIp,
+  };
 
   // Admin (Kimi) session — optional.
   try {

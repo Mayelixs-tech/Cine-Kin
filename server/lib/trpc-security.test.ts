@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   hasAllowedOrigin,
+  isDeviceApiTrpcRequest,
+  isHumanLoginTrpcRequest,
   isSensitiveTrpcBatch,
   isSensitiveTrpcRequest,
   sensitiveProcedureKey,
@@ -109,4 +111,38 @@ describe("same-origin browser guard", () => {
       true
     );
   });
+});
+
+describe("device API procedures", () => {
+  const deviceProcedures = [
+    "app.registerDevice",
+    "app.deviceStatus",
+    "app.devicePlaylists",
+  ];
+
+  it.each(deviceProcedures)("treats %s as sensitive: batching is forbidden", name => {
+    const url = `https://cine.test/api/trpc/${name}`;
+    expect(isSensitiveTrpcRequest(url)).toBe(true);
+    expect(isSensitiveTrpcBatch(`${url}?batch=1`)).toBe(true);
+    expect(isSensitiveTrpcBatch(`${url},${name}`)).toBe(true);
+    expect(sensitiveProcedureKey(url)).toBe(name);
+  });
+
+  it.each(deviceProcedures)(
+    "gives %s the device quota, not the strict human-login quota",
+    name => {
+      const url = `https://cine.test/api/trpc/${name}`;
+      expect(isDeviceApiTrpcRequest(url)).toBe(true);
+      expect(isHumanLoginTrpcRequest(url)).toBe(false);
+    }
+  );
+
+  it.each(["auth.adminLogin", "clientPortal.login", "reseller.login"])(
+    "keeps %s under the strict human-login quota",
+    name => {
+      const url = `https://cine.test/api/trpc/${name}`;
+      expect(isHumanLoginTrpcRequest(url)).toBe(true);
+      expect(isDeviceApiTrpcRequest(url)).toBe(false);
+    }
+  );
 });
