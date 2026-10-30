@@ -6,8 +6,9 @@ type Dashboard = {
   mac: string;
   name: string | null;
   licenseType: "12_months" | "unlimited" | null;
-  status: "inactive" | "active" | "expired";
+  status: "inactive" | "trial" | "active" | "expired";
   expiresAt: Date | string | null;
+  trialEndsAt: Date | string | null;
   parentalControlEnabled: boolean;
   playlistCount: number;
 };
@@ -19,20 +20,29 @@ export default function DashboardView({
   dashboard: Dashboard;
   onNavigate: (v: ClientView) => void;
 }) {
-  const isTrial = dashboard.status === "inactive" || dashboard.licenseType === null;
+  const isTrial = dashboard.status === "trial";
+  const inactive = dashboard.status === "inactive";
   const expired = dashboard.status === "expired";
+  // An expired status without any licence means the free trial has ended.
+  const trialEnded = expired && dashboard.licenseType === null;
 
   const statusBadge = isTrial
     ? { label: "Essai", className: "border-amber-500/30 bg-amber-500/10 text-amber-400" }
-    : expired
-      ? { label: "Expirée", className: "border-red-500/30 bg-red-500/10 text-red-400" }
-      : { label: "Active", className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400" };
+    : inactive
+      ? { label: "Inactive", className: "border-white/15 bg-white/5 text-white/50" }
+      : expired
+        ? { label: "Expirée", className: "border-red-500/30 bg-red-500/10 text-red-400" }
+        : { label: "Active", className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400" };
 
   const expiryLine = isTrial
-    ? "Aucune licence active — activez votre abonnement."
-    : dashboard.licenseType === "unlimited" || !dashboard.expiresAt
-      ? "Aucune expiration"
-      : `${expired ? "Expirée le" : "Active jusqu'au"} ${formatDate(dashboard.expiresAt)}`;
+    ? `Essai jusqu'au ${formatDate(dashboard.trialEndsAt)}`
+    : inactive
+      ? "Aucune licence active — activez votre abonnement."
+      : trialEnded
+        ? `Essai terminé le ${formatDate(dashboard.trialEndsAt)} — activez votre abonnement.`
+        : dashboard.licenseType === "unlimited" || !dashboard.expiresAt
+          ? "Aucune expiration"
+          : `${expired ? "Expirée le" : "Active jusqu'au"} ${formatDate(dashboard.expiresAt)}`;
 
   const tiles: { view: ClientView; icon: typeof ListVideo; label: string; hint: string }[] = [
     {

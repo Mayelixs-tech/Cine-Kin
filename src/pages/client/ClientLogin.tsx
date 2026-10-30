@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { MonitorSmartphone } from "lucide-react";
 import { trpc } from "@/providers/trpc";
 import { useToast } from "@/components/Toast";
@@ -9,7 +10,14 @@ import { formatMacInput, isValidMac } from "@/lib/licenseFormat";
 export default function ClientLogin() {
   const { toast } = useToast();
   const utils = trpc.useUtils();
-  const [mac, setMac] = useState("");
+  const [searchParams] = useSearchParams();
+  // /activation?mac=… (link and QR code shown by the CinéKin Player app)
+  // pre-fills the MAC, only when it is a valid MAC. The PIN is NEVER read from
+  // the URL: it would leak through history, logs and screenshots.
+  const [mac, setMac] = useState(() => {
+    const fromUrl = searchParams.get("mac");
+    return fromUrl && isValidMac(fromUrl) ? formatMacInput(fromUrl) : "";
+  });
   const [pin, setPin] = useState("");
 
   const login = trpc.clientPortal.login.useMutation({

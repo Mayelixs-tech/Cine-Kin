@@ -36,6 +36,7 @@ type ClientRow = {
   email: string | null;
   licenseType: LicenseType;
   expiresAt: Date | string | null;
+  trialEndsAt: Date | string | null;
   createdAt: Date | string;
   isRegistered: boolean;
   claimCodePending: boolean;
@@ -106,7 +107,7 @@ export default function ClientsSection() {
             <TableBody>
               {clients.data && clients.data.length > 0 ? (
                 clients.data.map(c => {
-                  const meta = statusMeta(computeStatus(c));
+                  const meta = statusMeta(computeStatus(c), c.trialEndsAt);
                   const permanent =
                     c.licenseType === "unlimited" && meta.label === "Active";
                   return (

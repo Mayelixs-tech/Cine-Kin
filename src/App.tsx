@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState } from "react";
-import { Routes, Route, useLocation } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import Layout from "./components/Layout";
 import Home from "./pages/Home";
@@ -91,6 +91,18 @@ function LazyPage({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Short link shown by the CinéKin Player app (cinekinpremium.live/activation).
+// Only the MAC is carried over to the client portal; any other parameter is
+// dropped so a PIN can never travel through a URL.
+function ActivationRedirect() {
+  const { search } = useLocation();
+  const mac = new URLSearchParams(search).get("mac");
+  const target = mac
+    ? `/espace-client?${new URLSearchParams({ mac }).toString()}`
+    : "/espace-client";
+  return <Navigate to={target} replace />;
+}
+
 export default function App() {
   const location = useLocation();
   useAnalytics();
@@ -124,6 +136,7 @@ export default function App() {
         <Route path="/admin" element={<LazyPage><AdminPanel /></LazyPage>} />
         <Route path="/revendeur" element={<LazyPage><ResellerPortal /></LazyPage>} />
         <Route path="/espace-client" element={<LazyPage><ClientPortal /></LazyPage>} />
+        <Route path="/activation" element={<ActivationRedirect />} />
         <Route path="/login" element={<Login />} />
         <Route path="*" element={<NotFound />} />
       </Routes>

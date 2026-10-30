@@ -2,7 +2,7 @@
 // server-side rules in api/lib/app-license.ts (labels/status/credit cost).
 
 export type LicenseType = "12_months" | "unlimited" | null;
-export type LicenseStatus = "inactive" | "active" | "expired";
+export type LicenseStatus = "inactive" | "trial" | "active" | "expired";
 
 export function licenseLabel(type: LicenseType): string {
   if (type === "12_months") return "12 mois";
@@ -38,22 +38,41 @@ export function formatMacInput(raw: string): string {
   return hex.match(/.{1,2}/g)?.join(":") ?? "";
 }
 
+// Same priority as the server: licence first, then the free trial.
 export function computeStatus(client: {
   licenseType: LicenseType;
   expiresAt: Date | string | null;
+  trialEndsAt: Date | string | null;
 }): LicenseStatus {
-  if (!client.licenseType) return "inactive";
-  if (client.licenseType === "unlimited" || !client.expiresAt) return "active";
-  return new Date(client.expiresAt).getTime() > Date.now()
-    ? "active"
-    : "expired";
+  if (client.licenseType) {
+    if (client.licenseType === "unlimited" || !client.expiresAt) return "active";
+    return new Date(client.expiresAt).getTime() > Date.now()
+      ? "active"
+      : "expired";
+  }
+  if (client.trialEndsAt) {
+    return new Date(client.trialEndsAt).getTime() > Date.now()
+      ? "trial"
+      : "expired";
+  }
+  return "inactive";
 }
 
-export function statusMeta(status: LicenseStatus): {
+export function statusMeta(
+  status: LicenseStatus,
+  trialEndsAt?: Date | string | null
+): {
   label: string;
   className: string;
 } {
   switch (status) {
+    case "trial":
+      return {
+        label: trialEndsAt
+          ? `Essai jusqu'au ${formatDate(trialEndsAt)}`
+          : "Essai",
+        className: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+      };
     case "active":
       return {
         label: "Active",
