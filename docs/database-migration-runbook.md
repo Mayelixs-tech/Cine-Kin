@@ -113,6 +113,34 @@ Une base vide ou déjà suivie par Drizzle est migrée automatiquement pendant l
 build Vercel. Une base historique non adoptée ou un schéma divergent fait
 échouer le build avant toute migration.
 
+## Migration incrémentale d'une base déjà suivie (ex. `0003_app_client_trial`)
+
+Une fois la baseline adoptée, les migrations suivantes ne repassent plus par
+`db:adopt`. Exemple : `0003_app_client_trial` ajoute deux colonnes nullables à
+`app_clients` (`trial_started_at`, `trial_ends_at`), sans aucune mise à jour des
+lignes existantes : les anciens appareils gardent `NULL` et ne reçoivent pas
+d'essai rétroactif.
+
+**Ordre impératif : migrer la base AVANT de déployer le nouveau code.** Le
+nouveau code lit `trial_ends_at` ; l'ancien code ignore ces colonnes, donc une
+base migrée reste compatible avec la version précédente.
+
+1. Staging : restaurer une sauvegarde récente de la production dans la base de
+   staging, puis exécuter `npm run db:deploy` (migration puis audit) avec
+   `DATABASE_URL` pointant sur cette copie. L'audit doit se terminer par
+   `✓ Schéma, historique et registre de crédits cohérents.`
+2. Staging : déployer le code et vérifier les parcours fonctionnels (dont
+   l'enregistrement d'un appareil CinéKin Player, l'essai de 7 jours et
+   `app.deviceStatus`).
+3. Production : créer une nouvelle sauvegarde et noter son identifiant.
+4. Production : exécuter `npm run db:deploy` et conserver sa sortie dans le
+   journal de déploiement.
+5. Production : déployer le nouveau code, puis revérifier les parcours
+   essentiels.
+
+En cas de problème après l'étape 4, remettre la version applicative
+précédente suffit : les colonnes ajoutées sont ignorées par l'ancien code.
+
 ## Retour arrière
 
 Les instructions DDL MySQL peuvent être validées implicitement et ne disposent
