@@ -68,6 +68,8 @@ const sampleAppClient: AppClient = {
   activatedAt: new Date(),
   expiresAt: new Date(Date.now() + 1_000_000),
   parentalControlPinHash: null,
+  trialStartedAt: null,
+  trialEndsAt: null,
   createdAt: new Date(),
 };
 

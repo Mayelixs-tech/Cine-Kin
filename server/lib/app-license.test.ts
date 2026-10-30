@@ -3,10 +3,14 @@ import {
   autoEmail,
   claimCodeSchema,
   computeRenewalExpiry,
+  computeTrialEndsAt,
   generateClaimCode,
+  isCinekinPlayerDeviceId,
+  licenseStatus,
   macAddressSchema,
   macLookupVariants,
   normalizeMac,
+  TRIAL_DURATION_DAYS,
 } from "./app-license";
 
 describe("MAC address canonicalisation", () => {
@@ -77,4 +81,82 @@ describe("licence renewal and claim codes", () => {
     expect(code).toMatch(/^CK-[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}$/);
     expect(claimCodeSchema.parse(code)).toMatch(/^CK[A-HJ-NP-Z2-9]{10}$/);
   });
+});
+
+describe("licenseStatus — licence and trial matrix", () => {
+  const now = new Date("2026-11-01T12:00:00.000Z");
+  const past = new Date("2026-10-01T00:00:00.000Z");
+  const future = new Date("2026-12-01T00:00:00.000Z");
+
+  it.each([
+    ["no licence, no trial", null, null, null, "inactive"],
+    ["no licence, trial running", null, null, future, "trial"],
+    ["no licence, trial finished", null, null, past, "expired"],
+    ["active 12-month licence", "12_months", future, null, "active"],
+    ["expired 12-month licence", "12_months", past, null, "expired"],
+    ["unlimited licence", "unlimited", null, null, "active"],
+    ["licence wins over a running trial", "12_months", future, future, "active"],
+    ["expired licence wins over a running trial", "12_months", past, future, "expired"],
+    ["unlimited wins over a finished trial", "unlimited", null, past, "active"],
+  ] as const)("%s → %s", (_label, licenseType, expiresAt, trialEndsAt, expected) => {
+    expect(licenseStatus({ licenseType, expiresAt, trialEndsAt }, now)).toBe(
+      expected
+    );
+  });
+
+  it("ends the trial exactly at trialEndsAt", () => {
+    expect(
+      licenseStatus({ licenseType: null, expiresAt: null, trialEndsAt: now }, now)
+    ).toBe("expired");
+  });
+});
+
+describe("free trial duration", () => {
+  it("lasts exactly seven days from the server clock", () => {
+    const start = new Date("2026-11-01T10:00:00.000Z");
+    expect(TRIAL_DURATION_DAYS).toBe(7);
+    expect(computeTrialEndsAt(start).toISOString()).toBe(
+      "2026-11-08T10:00:00.000Z"
+    );
+  });
+});
+
+describe("isCinekinPlayerDeviceId", () => {
+  it("accepts the real MAC vector produced by the CinéKin Player app", () => {
+    expect(macAddressSchema.parse("6E:63:F8:C4:03:0A")).toBe(
+      "6e:63:f8:c4:03:0a"
+    );
+    expect(isCinekinPlayerDeviceId("6E:63:F8:C4:03:0A")).toBe(true);
+  });
+
+  it.each([
+    "6E:63:F8:C4:03:0A",
+    "6e:63:f8:c4:03:0a",
+    "6E-63-F8-C4-03-0A",
+    "6E63F8C4030A",
+    " 6e:63:f8:c4:03:0a ",
+  ])("recognises the same device whatever the spelling: %j", (mac) => {
+    expect(isCinekinPlayerDeviceId(mac)).toBe(true);
+  });
+
+  it.each([
+    ["02:00:00:00:00:00", true],
+    ["fe:ff:ff:ff:ff:ff", true],
+    // Globally administered (real network card, label MAC): bit 0x02 is 0.
+    ["00:1a:2b:3c:4d:5e", false],
+    ["fc:00:00:00:00:00", false],
+    // Multicast bit (0x01) set: never a device address, even if local.
+    ["03:00:00:00:00:00", false],
+    ["ff:ff:ff:ff:ff:ff", false],
+    ["01:00:5e:00:00:01", false],
+  ])("%s → %s", (mac, expected) => {
+    expect(isCinekinPlayerDeviceId(mac)).toBe(expected);
+  });
+
+  it.each(["", "6e:63:f8", "zz:63:f8:c4:03:0a", "6e:63-f8:c4:03:0a"])(
+    "rejects malformed input %j",
+    (mac) => {
+      expect(isCinekinPlayerDeviceId(mac)).toBe(false);
+    }
+  );
 });

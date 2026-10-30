@@ -207,6 +207,7 @@ export const adminRouter = createRouter({
         activatedByResellerId: appClients.activatedByResellerId,
         activatedAt: appClients.activatedAt,
         expiresAt: appClients.expiresAt,
+        trialEndsAt: appClients.trialEndsAt,
         createdAt: appClients.createdAt,
         pinHash: appClients.pinHash,
         claimedAt: appClients.claimedAt,

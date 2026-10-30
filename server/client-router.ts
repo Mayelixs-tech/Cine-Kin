@@ -122,6 +122,7 @@ export const clientRouter = createRouter({
       status: licenseStatus(client),
       activatedAt: client.activatedAt,
       expiresAt: client.expiresAt,
+      trialEndsAt: client.trialEndsAt,
       parentalControlEnabled: client.parentalControlPinHash != null,
       playlistCount: playlistRows.length,
     };

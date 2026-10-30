@@ -115,13 +115,52 @@ export function autoEmail(
   return `${slug || "client"}-${macSuffix}@client.cine-kin.tv`;
 }
 
-export type LicenseStatus = "inactive" | "active" | "expired";
+export type LicenseStatus = "inactive" | "trial" | "active" | "expired";
 
-export function licenseStatus(client: {
-  licenseType: string | null;
-  expiresAt: Date | null;
-}): LicenseStatus {
-  if (!client.licenseType) return "inactive";
-  if (client.licenseType === "unlimited" || !client.expiresAt) return "active";
-  return client.expiresAt.getTime() > Date.now() ? "active" : "expired";
+// Priority: a licence (active or expired) always wins over the trial. Without
+// a licence, a running trial is "trial" and a finished one is "expired".
+// Devices that never had a trial (legacy rows, hardware MACs) stay "inactive".
+export function licenseStatus(
+  client: {
+    licenseType: string | null;
+    expiresAt: Date | null;
+    trialEndsAt: Date | null;
+  },
+  now: Date = new Date()
+): LicenseStatus {
+  if (client.licenseType) {
+    if (client.licenseType === "unlimited" || !client.expiresAt) return "active";
+    return client.expiresAt.getTime() > now.getTime() ? "active" : "expired";
+  }
+  if (client.trialEndsAt) {
+    return client.trialEndsAt.getTime() > now.getTime() ? "trial" : "expired";
+  }
+  return "inactive";
+}
+
+// Free trial granted once, when registerDevice creates the row of a trusted
+// CinéKin Player device. Always computed from the server clock.
+export const TRIAL_DURATION_DAYS = 7;
+
+export function computeTrialEndsAt(from: Date): Date {
+  return new Date(from.getTime() + TRIAL_DURATION_DAYS * 24 * 60 * 60 * 1000);
+}
+
+// CinéKin Player derives its MAC from HMAC(ANDROID_ID) and sets the first
+// octet to "unicast + locally administered" ((b & 0x03) === 0x02).
+//
+// Why this decides whether a self-registration is trusted:
+// - real network cards (the MAC printed on a box label, hence public) are
+//   globally administered: bit 0x02 is 0, so they never match;
+// - a CinéKin Player MAC cannot be guessed before the app's first launch, and
+//   the app registers on that first launch, so nobody can plant a PIN first.
+//
+// The client never says which app it is: such a flag would be forgeable. The
+// decision depends only on the MAC, which an attacker cannot choose for a
+// victim's device.
+export function isCinekinPlayerDeviceId(mac: string): boolean {
+  const canonical = normalizeMac(mac);
+  if (!canonical) return false;
+  const firstOctet = Number.parseInt(canonical.slice(0, 2), 16);
+  return (firstOctet & 0x03) === 0x02;
 }
