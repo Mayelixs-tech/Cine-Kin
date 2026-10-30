@@ -214,8 +214,19 @@ vi.mock("./queries/connection", async () => {
 // Real modules (schema + crypto are NOT mocked).
 import { appRouter } from "./router";
 import { createCallerFactory } from "./middleware";
-import { hashSecret, verifySecret } from "./lib/crypto";
-import { normalizeClaimCode } from "./lib/app-license";
+import { encryptSecret, hashSecret, verifySecret } from "./lib/crypto";
+import {
+  computeExpiry,
+  normalizeClaimCode,
+  TRIAL_DURATION_DAYS,
+} from "./lib/app-license";
+import {
+  DEVICE_LOCKED_MESSAGE,
+  DEVICE_PIN_MAX_FAILURES,
+  NEW_DEVICES_PER_IP_LIMIT,
+  newDevicesPerIpStore,
+} from "./lib/device-limits";
+import { DEVICE_CREDENTIALS_ERROR } from "./app-device-router";
 import type { TrpcContext } from "./context";
 import type { AppClient, User, Reseller } from "@db/schema";
 
@@ -270,6 +281,8 @@ function makeAppClient(over: Partial<AppClient> = {}): AppClient {
     activatedAt: new Date(),
     expiresAt: new Date(Date.now() + 1_000_000),
     parentalControlPinHash: null,
+    trialStartedAt: null,
+    trialEndsAt: null,
     createdAt: new Date(),
     ...over,
   };
@@ -469,9 +482,11 @@ describe("device claim — proof of possession", () => {
   });
 
   it("neutralises a PIN planted before the legitimate activation", async () => {
+    // Hardware (globally administered) MAC: its self-registration is never
+    // trusted, so a planted PIN must still be wiped by the paid activation.
     const anonymous = createCaller(makeCtx());
     await anonymous.app.registerDevice({
-      mac: "aa:bb:cc:dd:ee:33",
+      mac: "00:1a:2b:3c:4d:33",
       pin: "111111",
     });
     expect(shared.store.appClients[0]).toMatchObject({
@@ -482,7 +497,7 @@ describe("device claim — proof of possession", () => {
 
     await expect(
       anonymous.clientPortal.login({
-        mac: "aa:bb:cc:dd:ee:33",
+        mac: "00:1a:2b:3c:4d:33",
         pin: "111111",
       })
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
@@ -492,7 +507,7 @@ describe("device claim — proof of possession", () => {
     const activation = await createCaller(
       makeCtx({ reseller })
     ).reseller.activate({
-      mac: "aa:bb:cc:dd:ee:33",
+      mac: "00:1a:2b:3c:4d:33",
       licenseType: "12_months",
     });
 
@@ -500,14 +515,14 @@ describe("device claim — proof of possession", () => {
     expect(shared.store.appClients[0].pinHash).toBeNull();
 
     await expect(
-      anonymous.app.registerDevice({ mac: "aa:bb:cc:dd:ee:33", pin: "111111" })
+      anonymous.app.registerDevice({ mac: "00:1a:2b:3c:4d:33", pin: "111111" })
     ).rejects.toMatchObject({
       code: "UNAUTHORIZED",
     });
 
     await expect(
       anonymous.app.registerDevice({
-        mac: "aa:bb:cc:dd:ee:33",
+        mac: "00:1a:2b:3c:4d:33",
         pin: "222222",
         claimCode: activation.claimCode!,
       })
@@ -520,7 +535,7 @@ describe("device claim — proof of possession", () => {
     );
     await expect(
       anonymous.clientPortal.login({
-        mac: "aa:bb:cc:dd:ee:33",
+        mac: "00:1a:2b:3c:4d:33",
         pin: "222222",
       })
     ).resolves.toEqual({ success: true });
@@ -827,5 +842,512 @@ describe("reseller.changePassword", () => {
     await expect(
       anon.reseller.login({ username: "chp", password: newPw })
     ).resolves.toEqual({ success: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CinéKin Player device API (wave 2A).
+// The per-MAC lockout counters live in module-level stores that beforeEach
+// does not reset: every test below uses its own MACs and IPs.
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function deviceCaller(clientIp = "203.0.113.1") {
+  return createCaller(makeCtx({ clientIp }));
+}
+
+describe("registerDevice — CinéKin Player trust and 7-day trial", () => {
+  it("trusts a locally administered MAC and starts a 7-day trial", async () => {
+    const before = Date.now();
+    const result = await deviceCaller().app.registerDevice({
+      mac: "6E:63:F8:C4:03:0A",
+      pin: "135790",
+    });
+
+    const stored = shared.store.appClients[0];
+    expect(stored.mac).toBe("6e:63:f8:c4:03:0a");
+    expect(verifySecret("135790", stored.pinHash)).toBe(true);
+    expect(stored.claimedAt).toBeInstanceOf(Date);
+    expect(stored.trialStartedAt).toBeInstanceOf(Date);
+    expect(stored.trialEndsAt.getTime() - stored.trialStartedAt.getTime()).toBe(
+      TRIAL_DURATION_DAYS * DAY_MS
+    );
+    expect(stored.trialStartedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(result).toEqual({
+      registered: true,
+      activated: false,
+      alreadyKnown: false,
+      verificationRequired: false,
+      status: "trial",
+      trialEndsAt: stored.trialEndsAt.toISOString(),
+    });
+
+    // The client portal requires claimedAt: it works during the trial.
+    await expect(
+      deviceCaller().clientPortal.login({
+        mac: "6e:63:f8:c4:03:0a",
+        pin: "135790",
+      })
+    ).resolves.toEqual({ success: true });
+  });
+
+  it("never restarts nor extends the trial when the same device registers again", async () => {
+    const anonymous = deviceCaller();
+    await anonymous.app.registerDevice({ mac: "02:aa:00:00:00:01", pin: "111222" });
+    const stored = shared.store.appClients[0];
+    const startedAt = stored.trialStartedAt.getTime();
+    const endsAt = stored.trialEndsAt.getTime();
+
+    await expect(
+      anonymous.app.registerDevice({ mac: "02-AA-00-00-00-01", pin: "111222" })
+    ).resolves.toMatchObject({
+      alreadyKnown: true,
+      verificationRequired: false,
+      status: "trial",
+      trialEndsAt: new Date(endsAt).toISOString(),
+    });
+    expect(shared.store.appClients).toHaveLength(1);
+    expect(stored.trialStartedAt.getTime()).toBe(startedAt);
+    expect(stored.trialEndsAt.getTime()).toBe(endsAt);
+  });
+
+  it("refuses a wrong PIN for a known device and mutates nothing", async () => {
+    const anonymous = deviceCaller();
+    await anonymous.app.registerDevice({ mac: "02:aa:00:00:00:02", pin: "111222" });
+    const pinHash = shared.store.appClients[0].pinHash;
+
+    await expect(
+      anonymous.app.registerDevice({ mac: "02:aa:00:00:00:02", pin: "999999" })
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect(shared.store.appClients[0].pinHash).toBe(pinHash);
+  });
+
+  it("leaves a legacy row (PIN but no claimedAt) untrusted and without trial", async () => {
+    // Legacy rows predate migration 0001: even with a local MAC they stay
+    // untrusted until a one-time code is used.
+    shared.store.appClients.push(
+      makeAppClient({
+        id: 900,
+        mac: "02:aa:00:00:00:03",
+        pinHash: hashSecret("246802"),
+        claimedAt: null,
+        licenseType: null,
+        activatedByType: null,
+        activatedByResellerId: null,
+        activatedAt: null,
+        expiresAt: null,
+      })
+    );
+
+    await expect(
+      deviceCaller().app.registerDevice({ mac: "02:aa:00:00:00:03", pin: "246802" })
+    ).resolves.toMatchObject({
+      alreadyKnown: true,
+      verificationRequired: true,
+      status: "inactive",
+      trialEndsAt: null,
+    });
+    const stored = shared.store.appClients[0];
+    expect(stored.claimedAt).toBeNull();
+    expect(stored.trialEndsAt).toBeNull();
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:aa:00:00:00:03", pin: "246802" })
+    ).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+      message: DEVICE_CREDENTIALS_ERROR,
+    });
+  });
+
+  it("keeps a hardware MAC untrusted: no trial, and a paid activation still wipes the planted PIN", async () => {
+    const anonymous = deviceCaller();
+    await expect(
+      anonymous.app.registerDevice({ mac: "00:1A:2B:3C:4D:5E", pin: "111111" })
+    ).resolves.toMatchObject({
+      alreadyKnown: false,
+      verificationRequired: true,
+      status: "inactive",
+      trialEndsAt: null,
+    });
+    const stored = shared.store.appClients[0];
+    expect(stored.claimedAt).toBeNull();
+    expect(stored.trialStartedAt).toBeNull();
+    expect(stored.trialEndsAt).toBeNull();
+
+    await expect(
+      anonymous.app.deviceStatus({ mac: "00:1a:2b:3c:4d:5e", pin: "111111" })
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+
+    const reseller = makeReseller({ id: 1, credits: 1 });
+    shared.store.resellers.push(reseller);
+    const activation = await createCaller(
+      makeCtx({ reseller })
+    ).reseller.activate({ mac: "00:1a:2b:3c:4d:5e", licenseType: "12_months" });
+    expect(activation.claimCode).toBeTruthy();
+    expect(shared.store.appClients[0].pinHash).toBeNull();
+  });
+
+  it("still requires the one-time code for a pre-activated local MAC", async () => {
+    const reseller = makeReseller({ id: 1, credits: 1 });
+    shared.store.resellers.push(reseller);
+    const activation = await createCaller(
+      makeCtx({ reseller })
+    ).reseller.activate({ mac: "02:aa:00:00:00:04", licenseType: "12_months" });
+    expect(activation.claimCode).toBeTruthy();
+
+    await expect(
+      deviceCaller().app.registerDevice({ mac: "02:aa:00:00:00:04", pin: "123123" })
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect(shared.store.appClients[0].pinHash).toBeUndefined();
+  });
+
+  it("lets a reseller activate a device during its trial without wiping it nor adding the trial", async () => {
+    await deviceCaller().app.registerDevice({ mac: "02:aa:00:00:00:05", pin: "777888" });
+    const stored = shared.store.appClients[0];
+    const trialEndsAt = stored.trialEndsAt.getTime();
+    const reseller = makeReseller({ id: 1, credits: 1 });
+    shared.store.resellers.push(reseller);
+
+    const before = new Date();
+    const activation = await createCaller(
+      makeCtx({ reseller })
+    ).reseller.activate({ mac: "02:aa:00:00:00:05", licenseType: "12_months" });
+    const after = new Date();
+
+    // claimedAt is set: no code, the device keeps its PIN.
+    expect(activation.claimCode).toBeNull();
+    expect(verifySecret("777888", stored.pinHash)).toBe(true);
+    // The licence starts at activation time; trial days are not added.
+    expect(stored.expiresAt.getTime()).toBeGreaterThanOrEqual(
+      computeExpiry("12_months", before)!.getTime()
+    );
+    expect(stored.expiresAt.getTime()).toBeLessThanOrEqual(
+      computeExpiry("12_months", after)!.getTime()
+    );
+    expect(stored.trialEndsAt.getTime()).toBe(trialEndsAt);
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:aa:00:00:00:05", pin: "777888" })
+    ).resolves.toMatchObject({ status: "active", licenseType: "12_months" });
+  });
+
+  it("lets an admin activate a device during its trial without a code", async () => {
+    await deviceCaller().app.registerDevice({ mac: "02:aa:00:00:00:06", pin: "777888" });
+    const result = await createCaller(
+      makeCtx({ user: adminUser })
+    ).admin.appClientActivate({ mac: "02:aa:00:00:00:06", licenseType: "unlimited" });
+
+    expect(result).toMatchObject({ claimCode: null });
+    expect(verifySecret("777888", shared.store.appClients[0].pinHash)).toBe(true);
+    expect(shared.store.appClients[0].licenseType).toBe("unlimited");
+  });
+});
+
+describe("app.deviceStatus / app.devicePlaylists", () => {
+  function trustedClient(over: Partial<AppClient>) {
+    const client = makeAppClient({
+      claimedAt: new Date(),
+      pinHash: hashSecret("424242"),
+      licenseType: null,
+      activatedByType: null,
+      activatedByResellerId: null,
+      activatedAt: null,
+      expiresAt: null,
+      ...over,
+    });
+    shared.store.appClients.push(client);
+    return client;
+  }
+
+  function seedPlaylists(appClientId: number) {
+    shared.store.playlists.push(
+      {
+        id: 501,
+        appClientId,
+        name: "Bouquet Xtream",
+        format: "xtream",
+        source: "cinekin",
+        m3uUrl: null,
+        xtreamServerUrl: encryptSecret("https://xtream.example.test:8080"),
+        xtreamUsername: encryptSecret("user-42"),
+        xtreamPassword: encryptSecret("s3cret-pass"),
+        createdAt: new Date(),
+      },
+      {
+        id: 502,
+        appClientId,
+        name: "Liste M3U",
+        format: "m3u",
+        source: "external",
+        m3uUrl: "https://m3u.example.test/list.m3u",
+        xtreamServerUrl: null,
+        xtreamUsername: null,
+        xtreamPassword: null,
+        createdAt: new Date(),
+      }
+    );
+  }
+
+  it("reports a running trial with ISO dates and forbids caching", async () => {
+    const trialEndsAt = new Date(Date.now() + 3 * DAY_MS);
+    trustedClient({ mac: "02:bb:00:00:00:01", trialEndsAt });
+    const ctx = makeCtx({ clientIp: "203.0.113.2" });
+
+    const before = Date.now();
+    const result = await createCaller(ctx).app.deviceStatus({
+      mac: "02:BB:00:00:00:01",
+      pin: "424242",
+    });
+
+    expect(result).toEqual({
+      status: "trial",
+      licenseType: null,
+      expiresAt: null,
+      trialEndsAt: trialEndsAt.toISOString(),
+      serverTime: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+    });
+    expect(new Date(result.serverTime).getTime()).toBeGreaterThanOrEqual(before);
+    expect(ctx.resHeaders.get("cache-control")).toBe("no-store");
+  });
+
+  it.each([
+    [
+      "active",
+      "02:bb:00:00:01:01",
+      { licenseType: "12_months" as const, expiresAt: new Date(Date.now() + DAY_MS) },
+    ],
+    [
+      "expired",
+      "02:bb:00:00:01:02",
+      { licenseType: "12_months" as const, expiresAt: new Date(Date.now() - DAY_MS) },
+    ],
+    ["expired", "02:bb:00:00:01:03", { trialEndsAt: new Date(Date.now() - DAY_MS) }],
+    ["inactive", "02:bb:00:00:01:04", {}],
+  ])("reports %s (%s)", async (expected, mac, over) => {
+    trustedClient({ mac, ...over });
+    await expect(
+      deviceCaller().app.deviceStatus({ mac, pin: "424242" })
+    ).resolves.toMatchObject({ status: expected });
+  });
+
+  it("returns decrypted playlists for a device in trial", async () => {
+    const client = trustedClient({
+      mac: "02:bb:00:00:00:02",
+      trialEndsAt: new Date(Date.now() + DAY_MS),
+    });
+    seedPlaylists(client.id);
+    const ctx = makeCtx({ clientIp: "203.0.113.3" });
+
+    const result = await createCaller(ctx).app.devicePlaylists({
+      mac: "02:bb:00:00:00:02",
+      pin: "424242",
+    });
+
+    expect(result.status).toBe("trial");
+    expect(ctx.resHeaders.get("cache-control")).toBe("no-store");
+    expect(result.playlists).toEqual(
+      expect.arrayContaining([
+        {
+          id: 501,
+          name: "Bouquet Xtream",
+          format: "xtream",
+          source: "cinekin",
+          m3uUrl: null,
+          xtreamServerUrl: "https://xtream.example.test:8080",
+          xtreamUsername: "user-42",
+          xtreamPassword: "s3cret-pass",
+        },
+        {
+          id: 502,
+          name: "Liste M3U",
+          format: "m3u",
+          source: "external",
+          m3uUrl: "https://m3u.example.test/list.m3u",
+          xtreamServerUrl: null,
+          xtreamUsername: null,
+          xtreamPassword: null,
+        },
+      ])
+    );
+  });
+
+  it("returns decrypted playlists for an active licence", async () => {
+    const client = trustedClient({
+      mac: "02:bb:00:00:00:03",
+      licenseType: "unlimited",
+    });
+    seedPlaylists(client.id);
+    const result = await deviceCaller().app.devicePlaylists({
+      mac: "02:bb:00:00:00:03",
+      pin: "424242",
+    });
+    expect(result.status).toBe("active");
+    expect(result.playlists).toHaveLength(2);
+  });
+
+  it.each([
+    ["an expired licence", { licenseType: "12_months" as const, expiresAt: new Date(Date.now() - DAY_MS) }, "02:bb:00:00:00:04"],
+    ["a finished trial", { trialEndsAt: new Date(Date.now() - DAY_MS) }, "02:bb:00:00:00:05"],
+    ["no licence nor trial", {}, "02:bb:00:00:00:06"],
+  ])("returns no playlist and no credential for %s", async (_label, over, mac) => {
+    const client = trustedClient({ mac, ...over });
+    seedPlaylists(client.id);
+
+    const result = await deviceCaller().app.devicePlaylists({ mac, pin: "424242" });
+
+    expect(result.playlists).toEqual([]);
+    const serialised = JSON.stringify(result);
+    for (const secret of [
+      "s3cret-pass",
+      "user-42",
+      "xtream.example.test",
+      "m3u.example.test",
+    ]) {
+      expect(serialised).not.toContain(secret);
+    }
+  });
+
+  it("answers unknown MAC, wrong PIN and untrusted row with the same error", async () => {
+    trustedClient({ mac: "02:bb:00:00:00:07", trialEndsAt: new Date(Date.now() + DAY_MS) });
+    trustedClient({
+      id: 901,
+      mac: "02:bb:00:00:00:08",
+      claimedAt: null,
+      trialEndsAt: new Date(Date.now() + DAY_MS),
+    });
+    const anonymous = deviceCaller();
+
+    const attempts = [
+      anonymous.app.deviceStatus({ mac: "02:bb:00:00:00:99", pin: "424242" }),
+      anonymous.app.deviceStatus({ mac: "02:bb:00:00:00:07", pin: "000000" }),
+      anonymous.app.deviceStatus({ mac: "02:bb:00:00:00:08", pin: "424242" }),
+      anonymous.app.devicePlaylists({ mac: "02:bb:00:00:00:99", pin: "424242" }),
+      anonymous.app.devicePlaylists({ mac: "02:bb:00:00:00:07", pin: "000000" }),
+      anonymous.app.devicePlaylists({ mac: "02:bb:00:00:00:08", pin: "424242" }),
+    ];
+    for (const attempt of attempts) {
+      await expect(attempt).rejects.toMatchObject({
+        code: "UNAUTHORIZED",
+        message: DEVICE_CREDENTIALS_ERROR,
+      });
+    }
+  });
+});
+
+describe("per-MAC PIN lockout", () => {
+  async function registerTrialDevice(mac: string, pin = "314159") {
+    await deviceCaller().app.registerDevice({ mac, pin });
+  }
+
+  async function failTimes(mac: string, times: number, clientIp?: string) {
+    for (let i = 0; i < times; i += 1) {
+      await expect(
+        deviceCaller(clientIp).app.deviceStatus({ mac, pin: "000000" })
+      ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    }
+  }
+
+  it(`locks the MAC after ${DEVICE_PIN_MAX_FAILURES} failures, even with the right PIN`, async () => {
+    await registerTrialDevice("02:cc:00:00:00:01");
+    await failTimes("02:cc:00:00:00:01", DEVICE_PIN_MAX_FAILURES);
+
+    for (const call of [
+      deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:01", pin: "314159" }),
+      deviceCaller().app.devicePlaylists({ mac: "02:cc:00:00:00:01", pin: "314159" }),
+      deviceCaller().app.registerDevice({ mac: "02:cc:00:00:00:01", pin: "314159" }),
+    ]) {
+      await expect(call).rejects.toMatchObject({
+        code: "TOO_MANY_REQUESTS",
+        message: DEVICE_LOCKED_MESSAGE,
+      });
+    }
+  });
+
+  it("resets the failure counter after a successful PIN", async () => {
+    await registerTrialDevice("02:cc:00:00:00:02");
+    await failTimes("02:cc:00:00:00:02", DEVICE_PIN_MAX_FAILURES - 1);
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:02", pin: "314159" })
+    ).resolves.toMatchObject({ status: "trial" });
+
+    await failTimes("02:cc:00:00:00:02", DEVICE_PIN_MAX_FAILURES - 1);
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:02", pin: "314159" })
+    ).resolves.toMatchObject({ status: "trial" });
+  });
+
+  it("counts failures per MAC whatever the IP", async () => {
+    await registerTrialDevice("02:cc:00:00:00:03");
+    for (let i = 0; i < DEVICE_PIN_MAX_FAILURES; i += 1) {
+      await failTimes("02:cc:00:00:00:03", 1, `198.51.100.${i + 1}`);
+    }
+    await expect(
+      deviceCaller("192.0.2.99").app.deviceStatus({
+        mac: "02:cc:00:00:00:03",
+        pin: "314159",
+      })
+    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+  });
+
+  it("does not affect other devices", async () => {
+    await registerTrialDevice("02:cc:00:00:00:04");
+    await registerTrialDevice("02:cc:00:00:00:05");
+    await failTimes("02:cc:00:00:00:04", DEVICE_PIN_MAX_FAILURES);
+
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:05", pin: "314159" })
+    ).resolves.toMatchObject({ status: "trial" });
+  });
+
+  it("counts wrong PINs sent to registerDevice", async () => {
+    await registerTrialDevice("02:cc:00:00:00:06");
+    for (let i = 0; i < DEVICE_PIN_MAX_FAILURES; i += 1) {
+      await expect(
+        deviceCaller().app.registerDevice({ mac: "02:cc:00:00:00:06", pin: "000000" })
+      ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    }
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:06", pin: "314159" })
+    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+  });
+
+  it("counts failures on an unknown MAC so the lockout reveals nothing", async () => {
+    await failTimes("02:cc:00:00:00:07", DEVICE_PIN_MAX_FAILURES);
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:07", pin: "000000" })
+    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+  });
+});
+
+describe("registerDevice — new devices per IP", () => {
+  it(`refuses the ${NEW_DEVICES_PER_IP_LIMIT + 1}th new device from one IP`, async () => {
+    // Pre-fill the counter instead of hashing 100 PINs.
+    for (let i = 0; i < NEW_DEVICES_PER_IP_LIMIT; i += 1) {
+      await newDevicesPerIpStore.increment("203.0.113.200");
+    }
+
+    await expect(
+      deviceCaller("203.0.113.200").app.registerDevice({
+        mac: "02:dd:00:00:00:01",
+        pin: "123456",
+      })
+    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+    expect(shared.store.appClients).toHaveLength(0);
+
+    await expect(
+      deviceCaller("203.0.113.201").app.registerDevice({
+        mac: "02:dd:00:00:00:01",
+        pin: "123456",
+      })
+    ).resolves.toMatchObject({ status: "trial" });
+  });
+
+  it("counts only creations, not re-registrations of a known device", async () => {
+    const ip = "203.0.113.210";
+    await deviceCaller(ip).app.registerDevice({ mac: "02:dd:00:00:00:02", pin: "123456" });
+    for (let i = 0; i < 3; i += 1) {
+      await deviceCaller(ip).app.registerDevice({ mac: "02:dd:00:00:00:02", pin: "123456" });
+    }
+    const counter = await newDevicesPerIpStore.get!(ip);
+    expect(counter?.totalHits).toBe(1);
   });
 });
