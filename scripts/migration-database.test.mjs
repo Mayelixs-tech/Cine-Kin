@@ -60,20 +60,26 @@ function inspectionFromSnapshot(snapshot) {
 }
 
 describe("migration history", () => {
-  it("contains the baseline, data-hardening and rate-limit migrations", async () => {
+  it("contains the baseline, data-hardening, rate-limit and trial migrations", async () => {
     const definitions = await loadMigrationDefinitions();
     const securityDataMigration = definitions.all[1];
+    const rateLimitMigration = definitions.all[2];
 
-    expect(definitions.all).toHaveLength(3);
+    expect(definitions.all).toHaveLength(4);
     expect(Object.keys(definitions.baseline.snapshot.tables)).toHaveLength(7);
     expect(Object.keys(securityDataMigration.snapshot.tables)).toHaveLength(8);
+    expect(Object.keys(rateLimitMigration.snapshot.tables)).toHaveLength(9);
     expect(Object.keys(definitions.current.snapshot.tables)).toHaveLength(9);
     expect(definitions.baseline.hash).toMatch(/^[a-f0-9]{64}$/);
     expect(securityDataMigration.sql).toContain(
       "Solde historique repris lors de la migration"
     );
     expect(securityDataMigration.sql).toContain("claimed_at");
-    expect(definitions.current.sql).toContain("rate_limit_counters");
+    expect(rateLimitMigration.sql).toContain("rate_limit_counters");
+    // 0003 is purely additive: two nullable columns, no backfill.
+    expect(definitions.current.sql).toContain("trial_started_at");
+    expect(definitions.current.sql).toContain("trial_ends_at");
+    expect(definitions.current.sql).not.toMatch(/UPDATE|NOT NULL|DEFAULT/i);
   });
 
   it("matches the generated current snapshot exactly", async () => {

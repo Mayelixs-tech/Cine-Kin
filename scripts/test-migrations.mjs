@@ -124,7 +124,9 @@ async function verifyLegacyUpgrade() {
     const [clients] = await verification.connection.query(
       `SELECT pin_hash AS pinHash,
               claimed_at AS claimedAt,
-              claim_code_hash AS claimCodeHash
+              claim_code_hash AS claimCodeHash,
+              trial_started_at AS trialStartedAt,
+              trial_ends_at AS trialEndsAt
          FROM app_clients`
     );
     const [ledger] = await verification.connection.query(
@@ -142,6 +144,13 @@ async function verifyLegacyUpgrade() {
     ) {
       throw new Error(
         "La politique de revérification des anciens appareils n'est pas respectée."
+      );
+    }
+    // Migration 0003 is additive: existing devices never receive a
+    // retroactive free trial.
+    if (clients[0].trialStartedAt !== null || clients[0].trialEndsAt !== null) {
+      throw new Error(
+        "Un ancien appareil a reçu un essai gratuit rétroactif."
       );
     }
     if (

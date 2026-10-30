@@ -115,6 +115,10 @@ export const appClients = mysqlTable("app_clients", {
   expiresAt: timestamp("expires_at"),
   // Parental-control PIN (4 digits), hashed, distinct from the login PIN.
   parentalControlPinHash: varchar("parental_control_pin_hash", { length: 255 }),
+  // 7-day free trial, set once when registerDevice creates a trusted
+  // CinéKin Player row. NULL = no trial (legacy rows, hardware MACs).
+  trialStartedAt: timestamp("trial_started_at"),
+  trialEndsAt: timestamp("trial_ends_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
