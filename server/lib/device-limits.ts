@@ -6,10 +6,12 @@ import { createRateLimitStore } from "./database-rate-limit-store";
 // Tunable limits for the CinéKin Player device API.
 // ---------------------------------------------------------------------------
 
-// Per-MAC PIN lockout: after DEVICE_PIN_MAX_FAILURES wrong PINs within
-// DEVICE_PIN_FAILURE_WINDOW_MS, the MAC is locked for DEVICE_LOCK_DURATION_MS,
-// whatever the IP. Known trade-off: someone who knows a MAC can lock it for
-// 15 minutes by sending wrong PINs.
+// Per-MAC secret lockout (PIN or one-time activation code), whatever the IP:
+// at most DEVICE_PIN_MAX_FAILURES failed attempts per
+// DEVICE_PIN_FAILURE_WINDOW_MS; the next attempt locks the MAC for
+// DEVICE_LOCK_DURATION_MS. Known trade-offs: someone who knows a MAC can lock
+// it for 15 minutes by sending wrong PINs, and a legitimate request that
+// arrives in the middle of an attack burst can be refused.
 export const DEVICE_PIN_MAX_FAILURES = 5;
 export const DEVICE_PIN_FAILURE_WINDOW_MS = 15 * 60_000;
 export const DEVICE_LOCK_DURATION_MS = 15 * 60_000;
@@ -33,8 +35,8 @@ function createCounter(prefix: string, windowMs: number): Store {
   return store;
 }
 
-export const devicePinFailureStore = createCounter(
-  "device-pin-failures",
+export const deviceAttemptStore = createCounter(
+  "device-pin-attempts",
   DEVICE_PIN_FAILURE_WINDOW_MS
 );
 export const deviceLockStore = createCounter(
@@ -55,10 +57,33 @@ async function activeHits(store: Store, key: string): Promise<number> {
   return info.totalHits;
 }
 
+// "Reserve before verifying": every secret check on a MAC first takes a slot
+// in the attempt counter, BEFORE the row is read and before scrypt runs. A
+// check-then-record design lets parallel requests all pass the check before a
+// single failure is recorded (100 parallel guesses instead of 5). Here the
+// increment is atomic (synchronous in memory, one INSERT … ON DUPLICATE KEY
+// UPDATE in MySQL), so at most DEVICE_PIN_MAX_FAILURES requests per window
+// ever reach the secret check, sequential or parallel. The MySQL store reads
+// the total back in a second statement, so during a burst a request may see
+// a total inflated by others and be refused: it errs on the safe side only.
+//
+// A failure has nothing more to record: its slot is already taken. A success
+// gives its own slot back with refundDeviceAttempt.
+//
 // `mac` must be the canonical form (macAddressSchema output) so that every
 // spelling of one device shares a single counter.
-export async function assertDeviceNotLocked(mac: string): Promise<void> {
+export async function reserveDeviceAttempt(mac: string): Promise<void> {
   if ((await activeHits(deviceLockStore, mac)) > 0) {
+    throw new TRPCError({
+      code: "TOO_MANY_REQUESTS",
+      message: DEVICE_LOCKED_MESSAGE,
+    });
+  }
+  const attempts = (await deviceAttemptStore.increment(mac)).totalHits;
+  if (attempts > DEVICE_PIN_MAX_FAILURES) {
+    // Starts a 15-minute lock from now. Both stores only open a new window
+    // when none is active, so concurrent refusals never extend the lock.
+    await deviceLockStore.increment(mac);
     throw new TRPCError({
       code: "TOO_MANY_REQUESTS",
       message: DEVICE_LOCKED_MESSAGE,
@@ -66,18 +91,10 @@ export async function assertDeviceNotLocked(mac: string): Promise<void> {
   }
 }
 
-export async function recordDevicePinFailure(mac: string): Promise<void> {
-  const failures = await devicePinFailureStore.increment(mac);
-  if (failures.totalHits >= DEVICE_PIN_MAX_FAILURES) {
-    // Start a fresh, full-length lock from the failure that triggered it.
-    await deviceLockStore.resetKey(mac);
-    await deviceLockStore.increment(mac);
-    await devicePinFailureStore.resetKey(mac);
-  }
-}
-
-export async function clearDevicePinFailures(mac: string): Promise<void> {
-  await devicePinFailureStore.resetKey(mac);
+// Only one slot is given back: resetKey would also erase the slots of
+// attempts still in flight and reopen the race.
+export async function refundDeviceAttempt(mac: string): Promise<void> {
+  await deviceAttemptStore.decrement(mac);
 }
 
 function ipKey(clientIp: string | undefined): string {

@@ -15,11 +15,10 @@ import {
   macLookupVariants,
 } from "./lib/app-license";
 import {
-  assertDeviceNotLocked,
   assertNewDeviceQuota,
-  clearDevicePinFailures,
-  recordDevicePinFailure,
   recordNewDevice,
+  refundDeviceAttempt,
+  reserveDeviceAttempt,
 } from "./lib/device-limits";
 import { isDuplicateKeyError } from "./lib/db-errors";
 
@@ -106,18 +105,19 @@ async function authenticateDevice(
   mac: string,
   pin: string
 ): Promise<AppClient> {
-  await assertDeviceNotLocked(mac);
+  // The attempt slot is taken before the row is read and before scrypt, so
+  // parallel guesses cannot slip past the lockout. Unknown MACs consume a
+  // slot too: otherwise the lockout would reveal which MACs exist.
+  await reserveDeviceAttempt(mac);
   const client = await findClientByMac(mac);
   const pinMatches = verifyPinConstantTime(pin, client?.pinHash);
   if (!client || !client.claimedAt || !pinMatches) {
-    // Unknown MACs count too: otherwise the lockout would reveal existence.
-    await recordDevicePinFailure(mac);
     throw new TRPCError({
       code: "UNAUTHORIZED",
       message: DEVICE_CREDENTIALS_ERROR,
     });
   }
-  await clearDevicePinFailures(mac);
+  await refundDeviceAttempt(mac);
   return client;
 }
 
@@ -190,8 +190,10 @@ export const appDeviceRouter = createRouter({
 
       // Known MAC that was pre-activated (admin/reseller) but never registered:
       // possession must be proven with the one-time code displayed to the
-      // activator. Knowing a MAC address alone is never sufficient.
+      // activator. Knowing a MAC address alone is never sufficient. Code
+      // guesses share the per-MAC attempt budget of PIN guesses.
       if (!existing.pinHash) {
+        await reserveDeviceAttempt(mac);
         const claimExpired =
           !existing.claimCodeExpiresAt ||
           existing.claimCodeExpiresAt.getTime() <= Date.now();
@@ -244,6 +246,7 @@ export const appDeviceRouter = createRouter({
             });
           }
         }
+        await refundDeviceAttempt(mac);
         return {
           registered: true,
           activated: existing.licenseType != null,
@@ -255,16 +258,16 @@ export const appDeviceRouter = createRouter({
       }
 
       // Known MAC with a PIN → the PIN must match; nothing is mutated (the
-      // trial is never restarted nor extended). The lock is checked first.
-      await assertDeviceNotLocked(mac);
+      // trial is never restarted nor extended). The attempt slot is reserved
+      // before scrypt runs.
+      await reserveDeviceAttempt(mac);
       if (!verifySecret(input.pin, existing.pinHash)) {
-        await recordDevicePinFailure(mac);
         throw new TRPCError({
           code: "UNAUTHORIZED",
           message: "PIN incorrect pour cette adresse MAC.",
         });
       }
-      await clearDevicePinFailures(mac);
+      await refundDeviceAttempt(mac);
 
       // Idempotent: same MAC + correct PIN, no side effects.
       return {

@@ -42,6 +42,13 @@ vi.mock("drizzle-orm", async importOriginal => {
   };
 });
 
+// Real crypto, wrapped so tests can count how many secret checks (scrypt)
+// actually run.
+vi.mock("./lib/crypto", async importOriginal => {
+  const actual = await importOriginal<typeof import("./lib/crypto")>();
+  return { ...actual, verifySecret: vi.fn(actual.verifySecret) };
+});
+
 vi.mock("./queries/connection", async () => {
   const { getTableName } = await import("drizzle-orm");
   const store = shared.store;
@@ -1262,17 +1269,18 @@ describe("per-MAC PIN lockout", () => {
     }
   });
 
-  it("resets the failure counter after a successful PIN", async () => {
+  it("gives back only its own slot on success: 3 failures + success leave 2 failures", async () => {
     await registerTrialDevice("02:cc:00:00:00:02");
-    await failTimes("02:cc:00:00:00:02", DEVICE_PIN_MAX_FAILURES - 1);
+    await failTimes("02:cc:00:00:00:02", 3);
     await expect(
       deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:02", pin: "314159" })
     ).resolves.toMatchObject({ status: "trial" });
 
-    await failTimes("02:cc:00:00:00:02", DEVICE_PIN_MAX_FAILURES - 1);
+    // The success refunded its slot but not the 3 earlier failures.
+    await failTimes("02:cc:00:00:00:02", DEVICE_PIN_MAX_FAILURES - 3);
     await expect(
       deviceCaller().app.deviceStatus({ mac: "02:cc:00:00:00:02", pin: "314159" })
-    ).resolves.toMatchObject({ status: "trial" });
+    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
   });
 
   it("counts failures per MAC whatever the IP", async () => {
@@ -1351,3 +1359,163 @@ describe("registerDevice — new devices per IP", () => {
     expect(counter?.totalHits).toBe(1);
   });
 });
+
+describe("per-MAC lockout — reserve before verifying", () => {
+  const verifySecretSpy = vi.mocked(verifySecret);
+
+  function outcomes(results: PromiseSettledResult<unknown>[]) {
+    const codes = results.map(r =>
+      r.status === "rejected" ? (r.reason as { code: string }).code : "OK"
+    );
+    return {
+      unauthorized: codes.filter(c => c === "UNAUTHORIZED").length,
+      tooMany: codes.filter(c => c === "TOO_MANY_REQUESTS").length,
+      other: codes.filter(c => c !== "UNAUTHORIZED" && c !== "TOO_MANY_REQUESTS"),
+    };
+  }
+
+  it(
+    "lets at most 5 of 100 parallel wrong PINs reach the secret check",
+    async () => {
+      await deviceCaller().app.registerDevice({
+        mac: "02:ee:00:00:00:01",
+        pin: "314159",
+      });
+      verifySecretSpy.mockClear();
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 100 }, (_, i) =>
+          deviceCaller(`198.51.100.${i + 1}`).app.deviceStatus({
+            mac: "02:ee:00:00:00:01",
+            pin: "000000",
+          })
+        )
+      );
+
+      expect(verifySecretSpy.mock.calls.length).toBeLessThanOrEqual(
+        DEVICE_PIN_MAX_FAILURES
+      );
+      const { unauthorized, tooMany, other } = outcomes(results);
+      expect(other).toEqual([]);
+      expect(unauthorized).toBeLessThanOrEqual(DEVICE_PIN_MAX_FAILURES);
+      expect(unauthorized + tooMany).toBe(100);
+    },
+    30_000
+  );
+
+  it("keeps the lock for 15 full minutes from the first refusal", async () => {
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(start);
+      await deviceCaller().app.registerDevice({
+        mac: "02:ee:00:00:00:02",
+        pin: "314159",
+      });
+      for (let i = 0; i < DEVICE_PIN_MAX_FAILURES; i += 1) {
+        await expect(
+          deviceCaller().app.deviceStatus({ mac: "02:ee:00:00:00:02", pin: "000000" })
+        ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      }
+
+      const rightPin = () =>
+        deviceCaller().app.deviceStatus({ mac: "02:ee:00:00:00:02", pin: "314159" });
+      const minute = 60_000;
+
+      // First refusal 10 minutes after the failures: the lock starts here.
+      vi.setSystemTime(start + 10 * minute);
+      await expect(rightPin()).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+      // The failure window has ended, the lock has not.
+      vi.setSystemTime(start + 16 * minute);
+      await expect(rightPin()).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+      // Refusals during the lock do not extend it.
+      vi.setSystemTime(start + 25 * minute - 1_000);
+      await expect(rightPin()).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+      vi.setSystemTime(start + 25 * minute + 1_000);
+      await expect(rightPin()).resolves.toMatchObject({ status: "trial" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it(
+    "limits one-time activation code guesses per MAC, parallel bursts included",
+    async () => {
+      const reseller = makeReseller({ id: 1, credits: 1 });
+      shared.store.resellers.push(reseller);
+      const activation = await createCaller(
+        makeCtx({ reseller })
+      ).reseller.activate({ mac: "02:ee:00:00:00:03", licenseType: "12_months" });
+      verifySecretSpy.mockClear();
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 100 }, (_, i) =>
+          deviceCaller(`192.0.2.${i + 1}`).app.registerDevice({
+            mac: "02:ee:00:00:00:03",
+            pin: "222222",
+            claimCode: "CK-AAAAA-AAAAA",
+          })
+        )
+      );
+
+      expect(verifySecretSpy.mock.calls.length).toBeLessThanOrEqual(
+        DEVICE_PIN_MAX_FAILURES
+      );
+      const { unauthorized, tooMany, other } = outcomes(results);
+      expect(other).toEqual([]);
+      expect(unauthorized).toBeLessThanOrEqual(DEVICE_PIN_MAX_FAILURES);
+      expect(unauthorized + tooMany).toBe(100);
+
+      // Locked: even the right code is refused, nothing is claimed.
+      await expect(
+        deviceCaller().app.registerDevice({
+          mac: "02:ee:00:00:00:03",
+          pin: "222222",
+          claimCode: activation.claimCode!,
+        })
+      ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+      expect(shared.store.appClients[0].pinHash).toBeUndefined();
+    },
+    30_000
+  );
+
+  it("accepts the right activation code after a few wrong ones and refunds its slot", async () => {
+    const reseller = makeReseller({ id: 1, credits: 1 });
+    shared.store.resellers.push(reseller);
+    const activation = await createCaller(
+      makeCtx({ reseller })
+    ).reseller.activate({ mac: "02:ee:00:00:00:04", licenseType: "12_months" });
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        deviceCaller().app.registerDevice({
+          mac: "02:ee:00:00:00:04",
+          pin: "222222",
+          claimCode: "CK-AAAAA-AAAAA",
+        })
+      ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    }
+    await expect(
+      deviceCaller().app.registerDevice({
+        mac: "02:ee:00:00:00:04",
+        pin: "222222",
+        claimCode: activation.claimCode!,
+      })
+    ).resolves.toMatchObject({ registered: true, verificationRequired: false });
+
+    // 3 failures remain counted and the success gave its slot back: two more
+    // failures are still answered normally, the attempt after that is locked.
+    await failTimesOn("02:ee:00:00:00:04", 2);
+    await expect(
+      deviceCaller().app.deviceStatus({ mac: "02:ee:00:00:00:04", pin: "222222" })
+    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+  });
+});
+
+async function failTimesOn(mac: string, times: number) {
+  for (let i = 0; i < times; i += 1) {
+    await expect(
+      deviceCaller().app.deviceStatus({ mac, pin: "000000" })
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+  }
+}

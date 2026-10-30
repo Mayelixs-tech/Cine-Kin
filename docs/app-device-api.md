@@ -187,7 +187,7 @@ Hors production, `data.stack` peut aussi apparaître : ne jamais l'afficher.
 | 401 | `UNAUTHORIZED` | `PIN incorrect pour cette adresse MAC.` | `registerDevice` : MAC connue, PIN différent | Afficher une erreur ; ne pas réessayer en boucle |
 | 401 | `UNAUTHORIZED` | `Code d'activation invalide ou expiré.` | `registerDevice` : MAC pré-activée sans code valide | Demander le code au client |
 | 409 | `CONFLICT` | `Enregistrement concurrent détecté. Veuillez réessayer.` | Course rare au premier enregistrement | Réessayer une fois |
-| 429 | `TOO_MANY_REQUESTS` | `Trop de tentatives pour cet appareil. Réessayez dans 15 minutes.` | 5 PIN faux en 15 min sur cette MAC (quelle que soit l'IP) | Attendre 15 min |
+| 429 | `TOO_MANY_REQUESTS` | `Trop de tentatives pour cet appareil. Réessayez dans 15 minutes.` | Plus de 5 tentatives de PIN ou de code d'activation en 15 min sur cette MAC (quelle que soit l'IP), voir « Blocage par MAC » | Attendre 15 min, sans réessayer en boucle |
 | 429 | `TOO_MANY_REQUESTS` | `Trop de nouveaux appareils enregistrés depuis ce réseau. Réessayez plus tard.` | `registerDevice` : trop de nouvelles MAC depuis cette IP | Réessayer plus tard |
 
 Les limites par IP répondent **avant** tRPC, avec un autre format :
@@ -199,10 +199,46 @@ comme « réessayer plus tard », quel que soit le corps.
 
 | Limite | Valeur | Où |
 | ------ | ------ | -- |
-| PIN faux par MAC | 5 échecs / 15 min → blocage 15 min | `server/lib/device-limits.ts` |
+| Tentatives de PIN ou de code par MAC | 5 / 15 min → blocage 15 min | `server/lib/device-limits.ts` |
 | Nouvelles fiches par IP | 100 / heure | `server/lib/device-limits.ts` |
 | Requêtes `app.*` par IP et par procédure | 300 / 15 min | `APP_DEVICE_RATE_LIMIT_PER_IP`, `server/app.ts` |
 | Limite générale tRPC par IP | 100 / minute | `server/app.ts` (inchangée) |
+
+## Blocage par MAC : « réserver puis rembourser »
+
+Chaque vérification d'un secret sur une MAC (PIN sur `deviceStatus`,
+`devicePlaylists` et `registerDevice` pour une MAC connue ; code d'activation
+sur `registerDevice` pour une MAC pré-activée) **réserve d'abord une place**
+dans un compteur par MAC, avant tout calcul scrypt. Pour `deviceStatus` et
+`devicePlaylists`, la réservation précède aussi la lecture de la fiche ;
+`registerDevice` doit lire la fiche d'abord pour savoir s'il s'agit d'une
+création (qui ne réserve rien) :
+
+1. si la MAC est verrouillée → `429` ;
+2. sinon la tentative prend une place (fenêtre de 15 minutes) ;
+3. au-delà de 5 places → la MAC est verrouillée 15 minutes **à partir de ce
+   refus** (un verrou déjà posé n'est pas prolongé) et la réponse est `429` ;
+4. en cas de **succès**, la tentative **rend sa place** (une seule) ;
+   un échec la garde.
+
+Conséquences :
+
+- Que les requêtes arrivent l'une après l'autre ou en parallèle, au plus
+  5 tentatives par MAC et par fenêtre de 15 minutes atteignent la vérification
+  du secret.
+- Avec le compteur MySQL de production, le total est relu juste après
+  l'incrément atomique, dans une requête séparée : lors d'une rafale, chaque
+  requête peut relire un total gonflé par les autres et être refusée. Mesuré
+  en local : 100 requêtes parallèles, 0 acceptée. L'erreur va toujours dans le
+  sens prudent (refuser plus, jamais laisser passer plus de 5).
+- Un succès n'efface pas les échecs précédents : après 3 PIN faux puis le bon
+  PIN, il reste 2 échecs possibles avant le verrou.
+- Les MAC inconnues consomment aussi des places (sinon le blocage révélerait
+  quelles MAC existent).
+- La création d'une nouvelle fiche par `registerDevice` ne réserve rien.
+- **Compromis connu** : une requête légitime qui arrive au milieu d'une rafale
+  d'attaque sur la même MAC peut être refusée (`429`), et quelqu'un qui connaît
+  une MAC peut la verrouiller 15 minutes en envoyant de faux PIN.
 
 L'app ne doit pas appeler `deviceStatus` en boucle : un appel au lancement,
 puis à la demande (bouton « Actualiser ») ou à intervalle raisonnable.
